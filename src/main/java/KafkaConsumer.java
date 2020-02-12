@@ -1,6 +1,7 @@
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 
 import java.util.*;
 
@@ -8,7 +9,7 @@ public class KafkaConsumer {
     private static Scanner in;
 
     public static void main(String[] args) throws InterruptedException {
-        if(args.length != 4) {
+        if(args.length != 5) {
             System.out.println("TopicName, groupId, bootstrap server, offset need to be provided in the order");
             System.exit(-1);
         }
@@ -18,8 +19,9 @@ public class KafkaConsumer {
         String groupId = args[1];
         String brokerHost = args[2];
         String offset = args[3];
+        String partition = args[4];
 
-        ConsumerThread consumerThread = new ConsumerThread(topicName, groupId, brokerHost, offset);
+        ConsumerThread consumerThread = new ConsumerThread(topicName, groupId, brokerHost, offset, partition);
         consumerThread.start();
         String line = "";
         while (!line.equalsIgnoreCase("exit")) {
@@ -37,13 +39,16 @@ public class KafkaConsumer {
         private String groupId;
         private String brokerHost;
         private Long offset;
+        private Integer partition;
+        private volatile boolean commitInProgress;
         private org.apache.kafka.clients.consumer.KafkaConsumer<String, String> kafkaConsumer;
 
-        public ConsumerThread(String topicName, String groupId, String brokerHost, String offset) {
+        public ConsumerThread(String topicName, String groupId, String brokerHost, String offset, String partition) {
             this.topicName = topicName;
             this.groupId = groupId;
             this.brokerHost = brokerHost;
             this.offset = Long.parseLong(offset);
+            this.partition = Integer.parseInt(partition);
         }
 
         public void run() {
@@ -53,22 +58,37 @@ public class KafkaConsumer {
             consumerProperties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
             consumerProperties.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
             consumerProperties.put(ConsumerConfig.CLIENT_ID_CONFIG,"test-offset-reset");
+            consumerProperties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
 
             kafkaConsumer = new org.apache.kafka.clients.consumer.KafkaConsumer<>(consumerProperties);
-            kafkaConsumer.subscribe(Arrays.asList(topicName));
-
+            TopicPartition topicPartition = new TopicPartition(topicName, partition);
+            kafkaConsumer.assign(Arrays.asList(topicPartition));
             try {
-                kafkaConsumer.poll(0);
-                TopicPartition topicPartition = new TopicPartition(topicName, 0);
-                OffsetAndMetadata offsetAndMetadata = kafkaConsumer.committed(topicPartition);
-                System.out.println("current offset "+ offsetAndMetadata);
-                OffsetAndMetadata newOffsetAndMetadata = new OffsetAndMetadata(offset);
-                Map<TopicPartition, OffsetAndMetadata> commitOffsets = new HashMap<>();
-                commitOffsets.put(topicPartition, newOffsetAndMetadata);
-                kafkaConsumer.commitSync(commitOffsets);
-                OffsetAndMetadata committedOffset = kafkaConsumer.committed(topicPartition);
-                System.out.println("committed Offset"+committedOffset);
-                kafkaConsumer.unsubscribe();
+
+                while (true) {
+                    ConsumerRecords<String, String> records = kafkaConsumer.poll(500);
+                    // check if there is something to commit
+                    if (!commitInProgress) {
+                        commitInProgress = true;
+                        OffsetAndMetadata newOffsetAndMetadata = new OffsetAndMetadata(offset);
+                        Map<TopicPartition, OffsetAndMetadata> commitOffsets = new HashMap<>();
+                        commitOffsets.put(topicPartition, newOffsetAndMetadata);
+                        kafkaConsumer.commitAsync(commitOffsets, new OffsetCommitCallback() {
+                                @Override
+                                public void onComplete(Map<TopicPartition, OffsetAndMetadata> offsets, Exception ex) {
+                                    commitInProgress = false;
+                                    if (ex != null) {
+                                        System.out.println("Auto-commit of offsets");
+                                        ex.printStackTrace();
+                                    } else {
+                                        System.out.println("Completed auto-commit of offsets {} for group {}");
+                                    }
+                                }
+                        });
+                    }
+
+
+                }
             }
             catch (WakeupException we) {
                 System.out.println("Exception while consuming messages : " + we.getMessage());
